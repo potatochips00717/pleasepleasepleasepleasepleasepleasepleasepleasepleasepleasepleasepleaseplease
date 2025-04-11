@@ -1,0 +1,268 @@
+#Part 1
+# api_key = "sk-2UBr67da44166e9729143"
+api_key = "sk-eyPF67f81cbd473239719"
+
+
+# STEP 0: INSTALL DEPENDENCIES (if on Colab)
+# !pip install transformers datasets
+
+
+import requests, json, torch, time, requests
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from datasets import Dataset
+
+
+# =============================
+# STEP 1: Download Plant Data from API
+# =============================
+
+
+def safe_text(value):
+    if isinstance(value, list):
+        return " ".join(str(v) for v in value).strip()
+    elif isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+
+
+
+
+def fetch_plant_data(api_key, start_page=1, end_page=337):
+    all_data = []
+
+
+    for page in range(start_page, end_page + 1):
+        url = f"https://perenual.com/api/v2/species-list?key={api_key}&page={page}"
+        print(f"\nFetching page {page}...")
+
+
+        try:
+            res = requests.get(url)
+
+
+            if res.status_code != 200:
+                print("Failed to fetch data:", res.text)
+                if "X-RateLimit-Exceeded" in res.text:
+                    print("Rate limit exceeded, breaking the loop.")
+                    break
+                continue
+
+
+            data = res.json()
+
+
+            # Debugging: Check structure of the response
+            if page == 1:  # Only print for the first page
+                # print("API Response (first page):", json.dumps(data, indent=2))  # Pretty print the response
+                print("API Successfully conneced and data is being returned.")
+
+
+            if "data" not in data:
+                print(f"Unexpected response structure on page {page}: {data}")
+                continue
+
+
+            # Check if the 'data' field is empty
+            if len(data["data"]) == 0:
+                print(f"No plants found on page {page}")
+                continue
+
+
+            print(f"Found {len(data['data'])} plants on page {page}.")
+
+
+            for plant in data["data"]:
+                smart_name = safe_text(plant.get("scientific_name", "unknown"))
+                common_name = safe_text(plant.get("common_name", "unknown"))
+                description = safe_text(plant.get("description", "No description available"))
+
+
+                # Print to check what’s being processed
+                # print(f"Processing plant: {smart_name} ({common_name}) - Description: {description}")
+
+
+                if smart_name and common_name: ##Changed from if "no description available" is the description
+                    all_data.append({
+                        "scientific_name": smart_name,
+                        "common_name": common_name,
+                        "description": description
+                    })
+
+
+            time.sleep(1)  # Prevent hitting rate limit
+
+
+        except Exception as e:
+            print(f"Exception occurred on page {page}: {e}")
+
+
+    print(f"\n✅ Fetched {len(all_data)} plants total.")
+    return all_data
+
+
+def save_plants_to_file(plants, start_page, end_page):
+    # Save the plant data with filename based on start and end page numbers
+    filename = f"plants_data_{start_page}_to_{end_page}.json"
+    with open(filename, "w") as f:
+        json.dump(plants, f, indent=4)
+    print(f"Plants data saved to {filename}")
+
+
+def load_plants_from_file(start_page, end_page):
+    # Load the plant data from the file based on start and end page numbers
+    filename = f"plants_data_{start_page}_to_{end_page}.json"
+    with open(filename, "r") as f:
+        plants = json.load(f)
+    print(f"Loaded {len(plants)} plants from {filename}")
+    return plants
+
+
+
+
+# =============================
+# STEP 2: Generate Q&A Pairs
+# =============================
+
+
+def create_qa_pairs(plants):
+    qa_pairs = []
+    for p in plants:
+        sci, com, desc = p["scientific_name"], p["common_name"], p["description"]
+
+
+        if com and sci:
+            qa_pairs.append(f"Q: What is the scientific name of {com}?\nA: {sci}\n")
+            qa_pairs.append(f"Q: What is the common name of {sci}?\nA: {com}\n")
+
+
+        if com and desc:
+            qa_pairs.append(f"Q: Can you describe the plant {com}?\nA: {desc}\n")
+            qa_pairs.append(f"Q: Tell me about {sci} known for?\nA: {desc}\n")
+            qa_pairs.append(f"Q: Tell me about {com}.\nA: {desc}\n")
+
+
+        elif sci and desc:
+            qa_pairs.append(f"Q: What is {sci} known for?\nA: {desc}\n")
+
+
+
+
+    return qa_pairs
+
+
+# =============================
+# STEP 3: Tokenize and Create Dataset
+# =============================
+
+
+def tokenize_qa_pairs(pairs, tokenizer):
+    encodings = tokenizer(pairs, truncation=True, padding="max_length", max_length=128)
+    encodings["labels"] = encodings["input_ids"]
+    return Dataset.from_dict(encodings)
+
+
+# =============================
+# STEP 4: Fine-tune GPT-2
+# =============================
+
+
+def finetune_gpt2(dataset, tokenizer, output_dir="plant_gpt_model"):
+    model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=3,
+        per_device_train_batch_size=4,
+        save_steps=50,
+        save_total_limit=2,
+        logging_steps=10,
+        learning_rate=5e-3,
+        report_to="none",
+        logging_dir=f"{output_dir}/logs",
+    )
+
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+    )
+
+
+    trainer.train()
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    return model
+
+
+# =============================
+# STEP 5: Use the Fine-tuned Model to Answer Questions
+# =============================
+
+
+def ask_model(question, model, tokenizer, max_length=100):
+    input_ids = tokenizer.encode(question, return_tensors="pt")
+    output_ids = model.generate(input_ids, max_length=max_length, pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+
+
+
+
+
+
+
+
+
+#Part 2
+# =============================
+# RUN THE WORKFLOW!
+# =============================
+
+
+# api_key = "sk-2UBr67da44166e9729143"  #Manny's
+api_key = "sk-eyPF67f81cbd473239719"    #Chomko's
+start_page = 1
+end_page = 2
+
+
+# 1. Fetch plant data
+plants = fetch_plant_data(api_key, start_page=start_page, end_page=end_page)
+#Part 3
+print(len(plants))
+#Part 4
+save_plants_to_file(plants, start_page, end_page)
+#Part 5
+# 2. Load plant data from file
+plants_from_file = load_plants_from_file(start_page, end_page)
+#Part 6
+# 2. Create Q&A pairs
+qa_texts = create_qa_pairs(plants)
+
+
+# qa_texts = create_qa_pairs(plants_from_file)
+#Part 7 
+# 3. Tokenize
+tokenizer = AutoTokenizer.from_pretrained("gpt2-medium")
+tokenizer.pad_token = tokenizer.eos_token
+print(f"Number of QA texts: {len(qa_texts)}")
+print(qa_texts[:3])  # Show a few examples
+dataset = tokenize_qa_pairs(qa_texts, tokenizer)
+#part 8
+# 4. Fine-tune
+model = finetune_gpt2(dataset, tokenizer)
+#part 9 
+
+
+# 5. Test it!
+question = "What is the scientific name of rose?"
+print(ask_model("Q: " + question + "\nA:", model, tokenizer))
+#part 10
+question = "tell me about white fir"
+print(ask_model("Q: " + question + "\nA:", model, tokenizer))
+
+
